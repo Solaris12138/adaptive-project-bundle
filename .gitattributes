@@ -1,0 +1,3 @@
+# Preserve the exact tested source bytes used by the release SHA256 manifest.
+# Keep the release's CRLF and terminal blank lines instead of rewriting them.
+* -text whitespace=cr-at-eol,-blank-at-eof

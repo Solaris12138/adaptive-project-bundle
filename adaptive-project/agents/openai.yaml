@@ -1,0 +1,6 @@
+interface:
+  display_name: "自适应项目协作"
+  short_description: "自主探索模糊目标，比较验证候选方向，组织协作并维护有预算的可恢复项目"
+  default_prompt: "使用 $adaptive-project 在本项目中按需探索方向、验证关键假设、组织分工并在有限预算内交付可核查成果。"
+policy:
+  allow_implicit_invocation: true
