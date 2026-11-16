@@ -68,6 +68,8 @@ def inside(path, root):
 class Runtime:
     TERMINAL = {"done", "cancelled", "failed"}
     WORKER_OPS = {"task.claim", "task.heartbeat", "task.checkpoint", "task.submit", "memory.propose"}
+    DELEGATED_OPS = {"unit.create", "chat.bind", "task.create", "task.review", "recover",
+                     "outbox.enqueue", "outbox.begin"}
     CONTROL_OPS = {"control.pause", "control.resume", "budget.set", "exploration.budget.set", "scheduler.bind", "scheduler.enable"}
     SHUTDOWN_OPS = {"shutdown.prepare", "shutdown.confirm"}
     RECONCILE_OPS = {"outbox.resolve", "outbox.reconcile"} | SHUTDOWN_OPS
@@ -326,6 +328,142 @@ away a cold journal that ordinary SELECT/no-op UPDATE can leave behind.
                 raise RuntimeErrorDetail("Invalid input")
         return refs
 
+    def branch(self, state, root):
+        """Stable unit IDs, never titles, define the delegated subtree."""
+        result = {root}
+        while True:
+            expanded = result | {u["id"] for u in state["units"] if u["parent_id"] in result}
+            if expanded == result:
+                return result
+            result = expanded
+
+    def delegation(self, state, actor):
+        self.actor_unit(state, actor)
+        grants = [g for g in state.get("delegations", []) if g["chat_id"] == actor and g["status"] == "active"]
+        require(len(grants) == 1, "Active department delegation required", "unauthorized")
+        grant = grants[0]
+        require(self.actor_unit(state, actor) == grant["unit_id"], "Delegation binding changed", "unauthorized")
+        self.unchanged(grant["evidence"])
+        return grant
+
+    def delegated_check(self, state, o, actor, receipt=False):
+        """Check every operation inside the write transaction, including replay."""
+        op = o["op"]
+        if receipt:
+            item = self.get(state, "outbox", o.get("id"))
+            require(item.get("actor_id") == actor and item.get("delegation_id"),
+                    "Only the sender can reconcile a department dispatch", "unauthorized")
+            return None
+        grant = self.delegation(state, actor)
+        require(op in grant["capabilities"], "Operation outside department delegation", "unauthorized")
+        scope = self.branch(state, grant["unit_id"])
+        if op == "unit.create":
+            require(o.get("parent_id", "coordinator") in scope, "Child unit outside department", "unauthorized")
+        elif op == "chat.bind":
+            require(o.get("unit_id") in scope, "Chat outside department", "unauthorized")
+        elif op == "task.create":
+            require(o.get("owner_unit_id") in scope, "Task outside department", "unauthorized")
+            reviewer = o.get("reviewer_unit_id", o.get("owner_unit_id"))
+            require(reviewer in scope or reviewer in grant["peer_unit_ids"], "Reviewer outside delegated routes", "unauthorized")
+        elif op in {"task.review", "recover"}:
+            if op == "recover":
+                require(o.get("task_id"), "Department recovery requires a task ID", "unauthorized")
+            task = self.get(state, "tasks", o.get("task_id") if op == "recover" else o.get("id"))
+            owner = task.get("reviewer_unit_id", task["owner_unit_id"]) if op == "task.review" else task["owner_unit_id"]
+            require(owner in scope, "Task outside delegated responsibility", "unauthorized")
+            if op == "task.review":
+                require(task["attempts"] and task["attempts"][-1]["actor_id"] != actor,
+                        "Submitter cannot review their own work", "unauthorized")
+        elif op in {"outbox.enqueue", "outbox.begin"}:
+            if op == "outbox.begin":
+                item = self.get(state, "outbox", o.get("id"))
+                require(item.get("actor_id") == actor and item.get("delegation_id") == grant["id"],
+                        "Dispatch belongs to another sender", "unauthorized")
+                kind, payload = item["kind"], item["payload"]
+            else:
+                kind, payload = o.get("kind"), o.get("payload")
+            require(isinstance(payload, dict), "Payload must be object")
+            if kind == "create_chat":
+                require(payload.get("unit_id") in scope, "Chat creation outside department", "unauthorized")
+            else:
+                require(kind == "send_message", "Invalid outbox kind")
+                target = self.get(state, "chats", payload.get("chat_id"))
+                require(target["unit_id"] in scope or target["unit_id"] in grant["peer_unit_ids"],
+                        "Recipient outside delegated peer routes", "unauthorized")
+                require(self.get(state, "units", target["unit_id"])["status"] == "active", "Recipient department inactive", "inactive_actor")
+                task = self.get(state, "tasks", payload.get("task_id"))
+                require(task["owner_unit_id"] in scope | self.branch(state, target["unit_id"]),
+                        "Handoff task unrelated to sender or recipient", "unauthorized")
+                require(len(text(payload.get("summary"), "summary")) <= 2000, "Handoff summary too long")
+                if payload.get("refs"):
+                    if op == "outbox.begin": self.unchanged(payload["refs"])
+                    else: self.refs(payload["refs"])
+        return grant
+
+    @staticmethod
+    def delegation_charge(grant, key):
+        require(grant["usage"][key] < grant["limits"]["max_" + key], "Department quota exhausted", "resource_limit")
+        grant["usage"][key] += 1
+        grant["revision"] += 1
+
+    def view(self, actor, task_id=None, offset=0, limit=20):
+        """A bounded working view; full status remains available for audits."""
+        require(type(offset) is int and offset >= 0 and type(limit) is int and 1 <= limit <= 100, "Invalid view page")
+        state = self.read()
+        controller = actor in {state["coordinator_id"], state["operator_id"]}
+        unit_id = self.actor_unit(state, actor)
+        scope = self.branch(state, unit_id)
+        tasks = [t for t in state["tasks"] if controller or t["owner_unit_id"] in scope or
+                 t.get("reviewer_unit_id", t["owner_unit_id"]) in scope]
+        mailbox = [i for i in state["outbox"] if controller or i.get("actor_id") == actor or i["payload"].get("chat_id") == actor]
+        if task_id:
+            linked = {i["payload"].get("task_id") for i in mailbox}
+            require(any(t["id"] == task_id for t in tasks) or task_id in linked, "Task outside local view", "unauthorized")
+            tasks = [self.get(state, "tasks", task_id)]
+            mailbox = [i for i in mailbox if i["payload"].get("task_id") == task_id]
+        def summary(t):
+            value = {k: copy.deepcopy(t[k]) for k in ("id", "revision", "title", "status", "owner_unit_id", "dependencies", "accepted_artifacts")}
+            value["reviewer_unit_id"] = t.get("reviewer_unit_id", t["owner_unit_id"])
+            if task_id:
+                for key in ("acceptance", "inputs", "artifacts", "lease"):
+                    value[key] = copy.deepcopy(t[key])
+                value["attempt"] = copy.deepcopy(t["attempts"][-1]) if t["attempts"] else None
+                if value["attempt"]:
+                    value["attempt"]["checkpoints"] = value["attempt"]["checkpoints"][-1:]
+                value["verification"] = copy.deepcopy(t["verification"][-1:])
+                value["dependency_summaries"] = [{k: copy.deepcopy(self.get(state, "tasks", dep)[k])
+                                                   for k in ("id", "revision", "status", "accepted_artifacts")}
+                                                  for dep in t["dependencies"]]
+                memory_ids = {i["memory_id"] for i in t["inputs"] if isinstance(i, dict) and "memory_id" in i}
+                value["memories"] = [{k: copy.deepcopy(m[k]) for k in ("id", "revision", "kind", "status", "statement", "sources", "valid_until")}
+                                     for m in state["memories"] if m["id"] in memory_ids]
+            return value
+        grants = [g for g in state.get("delegations", []) if controller or g["chat_id"] == actor]
+        route_units = scope | {p for g in grants if g["status"] == "active" for p in g["peer_unit_ids"]}
+        routes = [{k: c[k] for k in ("id", "unit_id", "host_id", "thread_id", "status")} for c in state["chats"]
+                  if c["status"] == "active" and (controller or c["unit_id"] in route_units) and
+                  self.get(state, "units", c["unit_id"])["status"] == "active"]
+        def handoff(item):
+            value = {k: copy.deepcopy(item[k]) for k in ("id", "revision", "kind", "status")}
+            for key in ("actor_id", "delegation_id"):
+                if key in item: value[key] = item[key]
+            value["payload"] = {k: copy.deepcopy(v) for k, v in item["payload"].items()
+                                if k in {"unit_id", "chat_id", "task_id", "summary", "refs"}}
+            value["result"] = {k: v for k, v in (item.get("result") or {}).items()
+                               if k in {"host_id", "thread_id", "client_thread_id"}}
+            return value
+        return {"project_id": state["project_id"], "revision": state["revision"], "objective": state["charter"]["objective"],
+                "execution_mode": state["execution_mode"], "authority_sources": copy.deepcopy(state["authority_sources"]),
+                "scope": copy.deepcopy(state["charter"]["scope"]), "limits": copy.deepcopy(state["limits"]),
+                "project_status": state["project_status"], "control": copy.deepcopy(state["control"]),
+                "scheduler": {k: copy.deepcopy(state["scheduler"][k]) for k in ("usage", "budgets", "expires_at", "not_before")},
+                "actor_id": actor, "unit_id": unit_id, "offset": offset, "limit": limit,
+                "tasks": [summary(t) for t in tasks[offset:offset + limit]], "tasks_total": len(tasks),
+                "outbox": [handoff(i) for i in mailbox[offset:offset + limit]], "outbox_total": len(mailbox),
+                "delegations": copy.deepcopy(grants[offset:offset + limit]), "delegations_total": len(grants),
+                "routes": routes[offset:offset + limit], "routes_total": len(routes),
+                "units": [{k: u[k] for k in ("id", "name", "mission", "parent_id", "status")} for u in state["units"] if u["id"] in scope]}
+
     def ready(self, state, task):
         return all(self.get(state, "tasks", d)["status"] == "done" for d in task["dependencies"])
 
@@ -465,6 +603,18 @@ away a cold journal that ordinary SELECT/no-op UPDATE can leave behind.
         for chat in chats.values():
             require(chat["unit_id"] in units, "Chat owner missing")
             require(chat["status"] == "retired" or units[chat["unit_id"]]["status"] != "retired", "Chat under retired unit")
+        grants = state.get("delegations", [])
+        require(isinstance(grants, list) and len({g["id"] for g in grants}) == len(grants) and
+                len({g["chat_id"] for g in grants}) == len(grants), "Invalid department delegation ledger")
+        for grant in grants:
+            require(grant["chat_id"] in chats and grant["unit_id"] in units and grant["status"] in {"active", "revoked"}, "Invalid delegation binding")
+            require(set(grant["capabilities"]) <= self.DELEGATED_OPS and grant["evidence"], "Invalid delegation capabilities")
+            require(all(p in units and p != "coordinator" for p in grant["peer_unit_ids"]), "Invalid delegation peer")
+            require(set(grant["usage"]) == {"tasks", "units", "dispatches"} and
+                    set(grant["limits"]) == {"max_tasks", "max_units", "max_dispatches"}, "Invalid delegation quotas")
+            for key, value in grant["usage"].items():
+                maximum = grant["limits"]["max_" + key]
+                require(type(value) is int and type(maximum) is int and 0 <= value <= maximum, "Invalid delegation usage")
         def visit(tid, parents):
             require(tid not in parents, "Task dependency cycle")
             for dep in tasks[tid]["dependencies"]:
@@ -474,6 +624,7 @@ away a cold journal that ordinary SELECT/no-op UPDATE can leave behind.
         for task in tasks.values():
             visit(task["id"], set())
             require(task["owner_unit_id"] in units, "Task owner missing")
+            require(task.get("reviewer_unit_id", task["owner_unit_id"]) in units, "Task reviewer missing")
             require(task["status"] in self.TERMINAL or units[task["owner_unit_id"]]["status"] != "retired", "Unfinished task owned by retired unit")
             if task["status"] == "running":
                 require(task["lease"] is not None, "Running task without lease")
@@ -838,7 +989,9 @@ away a cold journal that ordinary SELECT/no-op UPDATE can leave behind.
             if names == ["wake.end"]: self.wake_live(state, request)
             return
         if all(n in self.RECONCILE_OPS for n in names):
-            require(operator or coordinator, "Reconciliation requires coordinator or operator", "unauthorized")
+            if not (operator or coordinator):
+                require(all(n in {"outbox.resolve", "outbox.reconcile"} for n in names), "Shutdown requires controller", "unauthorized")
+                for o in request["operations"]: self.delegated_check(state, o, actor, receipt=True)
             return
         if all(n in self.MAINTENANCE_OPS for n in names) and state["project_status"] == "completed":
             require(operator or coordinator, "Maintenance requires coordinator or operator", "unauthorized")
@@ -853,8 +1006,11 @@ away a cold journal that ordinary SELECT/no-op UPDATE can leave behind.
         elif coordinator:
             if state["execution_mode"] == "background": self.wake_live(state, request)
         else:
-            require(all(n in self.WORKER_OPS for n in names), "Worker cannot coordinate", "unauthorized")
+            require(all(n in self.WORKER_OPS | self.DELEGATED_OPS for n in names), "Worker cannot coordinate", "unauthorized")
             self.actor_unit(state, actor)
+            if any(n in self.DELEGATED_OPS for n in names):
+                grant = self.delegation(state, actor)
+                require(all(n in self.WORKER_OPS or n in grant["capabilities"] for n in names), "Operation outside department delegation", "unauthorized")
 
     def shutdown_closure(self, state):
         """Global admission closure, independent of host state and wake quotas."""
@@ -1069,9 +1225,45 @@ away a cold journal that ordinary SELECT/no-op UPDATE can leave behind.
     def base_operation(self, con, state, operation, actor):
         o, op = operation, operation.get("op")
         coordinator = actor in {state["coordinator_id"], state["operator_id"]}
-        require(op in self.WORKER_OPS or coordinator or op == "coordinator.takeover", "Coordinator operation required", "unauthorized")
+        delegated = None
+        if not coordinator and op in self.DELEGATED_OPS:
+            delegated = self.delegated_check(state, o, actor)
+            charge = {"task.create": "tasks", "unit.create": "units", "outbox.begin": "dispatches"}.get(op)
+            if charge: self.delegation_charge(delegated, charge)
+        elif not coordinator and op in {"outbox.resolve", "outbox.reconcile"}:
+            self.delegated_check(state, o, actor, receipt=True)
+        else:
+            require(op in self.WORKER_OPS or coordinator, "Coordinator operation required", "unauthorized")
         if op in self.WORKER_OPS:
             self.actor_unit(state, actor)
+        if op == "delegation.grant":
+            self.auth(state, "adjust_units_within_scope")
+            gid = ident(o.get("id")); chat = self.get(state, "chats", o.get("chat_id"))
+            self.actor_unit(state, chat["id"])
+            require(chat["unit_id"] != "coordinator", "Delegate a department, not project control", "unauthorized")
+            grants = state.setdefault("delegations", [])
+            require(not any(g["id"] == gid or g["chat_id"] == chat["id"] for g in grants), "Delegation already exists; quotas cannot reset")
+            capabilities = list_text(o.get("capabilities"), "capabilities")
+            require(set(capabilities) <= self.DELEGATED_OPS, "Invalid delegated capability", "unauthorized")
+            peers = list_text(o.get("peer_unit_ids", []), "peer_unit_ids", empty=True)
+            for peer in peers:
+                require(self.get(state, "units", peer)["status"] == "active" and peer != "coordinator", "Invalid peer department")
+            limits = o.get("limits")
+            require(isinstance(limits, dict) and set(limits) == {"max_tasks", "max_units", "max_dispatches"} and
+                    all(type(v) is int and v >= 0 for v in limits.values()), "Finite department quotas required")
+            require(limits["max_units"] <= state["limits"]["max_nonretired_units"] and
+                    limits["max_dispatches"] <= state["scheduler"]["budgets"]["max_dispatches"], "Delegation exceeds project limits", "resource_limit")
+            grant = {"id": gid, "revision": 1, "status": "active", "chat_id": chat["id"], "unit_id": chat["unit_id"],
+                     "capabilities": capabilities, "peer_unit_ids": peers, "limits": limits,
+                     "usage": {"tasks": 0, "units": 0, "dispatches": 0}, "evidence": self.refs(o.get("evidence")),
+                     "granted_by": actor, "created_at": stamp()}
+            grants.append(grant); return copy.deepcopy(grant)
+        if op == "delegation.revoke":
+            grant = self.get(state, "delegations", o.get("id"))
+            self.version(grant, o, "expected_delegation_revision")
+            require(grant["status"] == "active", "Delegation already revoked")
+            grant["status"] = "revoked"; grant["revision"] += 1
+            return copy.deepcopy(grant)
         if op == "task.cancel":
             task = self.get(state, "tasks", o.get("id"))
             self.version(task, o, "expected_task_revision")
@@ -1101,6 +1293,8 @@ away a cold journal that ordinary SELECT/no-op UPDATE can leave behind.
                 require(o["status"] == "active" or not any(t["status"] == "running" for t in owned), "Unit has running tasks")
                 if o["status"] == "retired":
                     require(not owned and not any(c["unit_id"] == unit["id"] and c["status"] != "retired" for c in state["chats"]), "Transfer work and chats before retirement")
+                    require(not any(t.get("reviewer_unit_id") == unit["id"] and t["status"] not in self.TERMINAL for t in state["tasks"]),
+                            "Complete or transfer review responsibilities before retirement")
                 unit["status"] = o["status"]
             unit["revision"] += 1; return copy.deepcopy(unit)
         if op == "unit.merge":
@@ -1108,8 +1302,12 @@ away a cold journal that ordinary SELECT/no-op UPDATE can leave behind.
             source = self.get(state, "units", o.get("source_id")); target = self.get(state, "units", o.get("target_id"))
             self.version(source, o, "expected_source_revision"); self.version(target, o, "expected_target_revision")
             require(source["id"] != "coordinator" and source["id"] != target["id"] and source["status"] != "retired" and target["status"] == "active", "Invalid merge")
+            require(not any(g["status"] == "active" and g["unit_id"] == source["id"] for g in state.get("delegations", [])),
+                    "Revoke source department delegation before merging", "unauthorized")
             require(not any(u["parent_id"] == source["id"] and u["status"] != "retired" for u in state["units"]), "Move live children first")
             for task in state["tasks"]:
+                if task.get("reviewer_unit_id") == source["id"] and task["status"] not in self.TERMINAL:
+                    task["reviewer_unit_id"] = target["id"]; task["revision"] += 1
                 if task["owner_unit_id"] == source["id"] and task["status"] not in self.TERMINAL:
                     require(task["status"] != "running", "Revoke running tasks before merge")
                     task["owner_unit_id"] = target["id"]; task["revision"] += 1; task["fencing_token"] += 1
@@ -1134,7 +1332,10 @@ away a cold journal that ordinary SELECT/no-op UPDATE can leave behind.
         if op == "task.create":
             tid = ident(o.get("id")); require(not any(t["id"] == tid for t in state["tasks"]), "Task exists")
             unit = self.get(state, "units", o.get("owner_unit_id")); require(unit["status"] == "active", "Owner inactive")
+            reviewer = self.get(state, "units", o.get("reviewer_unit_id", unit["id"]))
+            require(reviewer["status"] == "active", "Reviewer inactive")
             task = {"id": tid, "revision": 1, "title": text(o.get("title")), "owner_unit_id": unit["id"],
+                    "reviewer_unit_id": reviewer["id"],
                     "acceptance": list_text(o.get("acceptance")), "inputs": o.get("inputs", []), "dependencies": o.get("dependencies", []),
                     "fencing_token": 0, "lease": None, "attempts": [], "artifacts": [], "accepted_artifacts": [], "verification": [], "checkpoints": []}
             require(isinstance(task["inputs"], list) and isinstance(task["dependencies"], list), "Invalid task lists")
@@ -1259,6 +1460,10 @@ away a cold journal that ordinary SELECT/no-op UPDATE can leave behind.
             if kind == "create_chat":
                 require(sum(c["status"] == "active" for c in state["chats"]) + self.creation_reservations(state) < state["limits"]["max_active_chats"], "Chat creation reservations exceed cap", "resource_limit")
             item = {"id": oid, "revision": 1, "kind": kind, "payload": copy.deepcopy(payload), "status": "pending", "result": None}
+            item["actor_id"] = actor
+            if delegated:
+                item["delegation_id"] = delegated["id"]
+                if payload.get("refs"): item["payload"]["refs"] = self.refs(payload["refs"])
             state["outbox"].append(item); return copy.deepcopy(item)
         if op in {"outbox.begin", "outbox.resolve", "outbox.reconcile"}:
             item = self.get(state, "outbox", o.get("id")); self.version(item, o, "expected_outbox_revision")
@@ -1303,6 +1508,8 @@ away a cold journal that ordinary SELECT/no-op UPDATE can leave behind.
         self.authorize_request(state, request)
         for operation, result in zip(request["operations"], response["results"]):
             op = operation["op"]
+            if actor not in {state["coordinator_id"], state["operator_id"]} and op in self.DELEGATED_OPS:
+                self.delegated_check(state, operation, actor)
             if op in self.SHUTDOWN_OPS:
                 intent = self.shutdown_intent(state, operation["id"])
                 require(self.shutdown_current(state, intent), "Shutdown replay is stale", "shutdown_stale")
@@ -1380,9 +1587,16 @@ def main(argv=None):
     commands = parser.add_subparsers(dest="command", required=True)
     commands.add_parser("status")
     commands.add_parser("plan")
+    command = commands.add_parser("view")
+    command.add_argument("--actor", required=True)
+    command.add_argument("--task")
+    command.add_argument("--offset", type=int, default=0)
+    command.add_argument("--limit", type=int, default=20)
     commands.add_parser("storage-recover").add_argument("--acknowledge-stopped-writers", action="store_true")
     commands.add_parser("init").add_argument("--charter", required=True)
-    commands.add_parser("apply").add_argument("--request", required=True)
+    command = commands.add_parser("apply")
+    command.add_argument("--request", required=True)
+    command.add_argument("--compact", action="store_true", help="Return transaction results without full project history")
     for name in ["pause", "resume"]:
         command = commands.add_parser(name)
         command.add_argument("--actor", required=True)
@@ -1393,6 +1607,7 @@ def main(argv=None):
         runtime = Runtime(args.project, args.allow_test_faults)
         if args.command == "status": result = runtime.read()
         elif args.command == "plan": result = runtime.plan()
+        elif args.command == "view": result = runtime.view(args.actor, args.task, args.offset, args.limit)
         elif args.command == "storage-recover": result = runtime.storage_recover(args.acknowledge_stopped_writers)
         elif args.command in {"pause", "resume"}:
             state = runtime.read()
@@ -1402,6 +1617,8 @@ def main(argv=None):
         else:
             data = json.loads(Path(args.charter if args.command == "init" else args.request).read_text(encoding="utf-8-sig"))
             result = runtime.init(data) if args.command == "init" else runtime.transact(data)
+            if args.command == "apply" and args.compact:
+                result.pop("state", None)
         print(json.dumps(result, ensure_ascii=False, indent=2)); return 0
     except (RuntimeErrorDetail, OSError, ValueError, TypeError, KeyError, sqlite3.Error) as error:
         print(json.dumps({"error": str(error), "code": getattr(error, "code", "runtime_error")}, ensure_ascii=False), file=sys.stderr); return 1

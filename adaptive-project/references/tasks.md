@@ -1,13 +1,14 @@
 # 职责、任务、记忆与事务
 
-`scripts/runtime.py` 使用 Python 3.8 标准库与本地 SQLite，多进程共享同一项目数据库 `.adaptive-v4/state.sqlite3`。不需要常驻服务器；它不调用 Codex、不联网，也不自行创建聊天。Codex 协调者负责真实会话操作，运行时负责事务、租约、版本和持久状态。
+`scripts/runtime.py` 使用 Python 3.8 标准库与本地 SQLite，多进程共享同一项目数据库 `.adaptive-v4/state.sqlite3`。不需要常驻服务器；它不调用 Codex、不联网，也不自行创建聊天。Codex 协调者及获有限委派的部门负责人承担真实会话操作，运行时负责范围、额度、事务、租约、版本和持久状态。部门契约见 [部门协作](department-collaboration.md)。
 
 ## API 与命令
 
 ```text
 python -X utf8 runtime.py --project PROJECT init --charter FILE
-python -X utf8 runtime.py --project PROJECT status
-python -X utf8 runtime.py --project PROJECT apply --request FILE
+python -X utf8 runtime.py --project PROJECT view --actor ACTOR
+python -X utf8 runtime.py --project PROJECT view --actor ACTOR --task TASK
+python -X utf8 runtime.py --project PROJECT apply --request FILE --compact
 ```
 
 Python 接口：`Runtime(project).init(charter)` 返回初始状态，`read()` 返回当前状态，`transact(request)` 返回 `{revision, results, state, replayed}`。错误为 `RuntimeErrorDetail`，包含 `code`；CLI 错误输出 JSON 并返回非零退出码。
@@ -28,7 +29,7 @@ Python 接口：`Runtime(project).init(charter)` 返回初始状态，`read()` �
 
 ## 协调者操作
 
-除特别说明，由协调者或契约允许的操作员执行；后台协调业务必须携带有效wake，操作员不能与未到期wake并发改组织。coordinator.takeover禁用，身份不会因自报接管而改变。已有单元初始 ID 为 `coordinator`。
+下列操作由协调者或契约允许的操作员执行；具有 delegation 的负责人还可在 [限定范围](department-collaboration.md) 内执行 unit.create、chat.bind、task.create、task.review 和指定 task_id 的 recover，其余组织与项目级操作保留控制权限。后台协调业务必须携带有效wake，操作员不能与未到期wake并发改组织。coordinator.takeover禁用，身份不会因自报接管而改变。已有单元初始 ID 为 `coordinator`。
 
 | 操作 | 必需字段与行为 |
 | --- | --- |
@@ -38,7 +39,7 @@ Python 接口：`Runtime(project).init(charter)` 返回初始状态，`read()` �
 | unit.merge | source_id, target_id, expected_source_revision, expected_target_revision；迁移未完成任务及聊天绑定；源退役；有运行任务时拒绝 |
 | chat.bind | id（逻辑工作者 actor_id）, unit_id, host_id, thread_id；真实工具返回 ID；可选 title；一个真实聊天只允许一个未退役绑定 |
 | chat.status | id, expected_chat_revision, status（active/dormant/retired）；有运行租约时拒绝休眠或退役 |
-| task.create | id, title, owner_unit_id, acceptance；可选 inputs, dependencies；依赖未完成时 blocked，否则 ready |
+| task.create | id, title, owner_unit_id, acceptance；可选 reviewer_unit_id（默认 owner_unit_id）、inputs, dependencies；依赖未完成时 blocked，否则 ready |
 | task.reassign | id, expected_task_revision, owner_unit_id；运行任务可传 revoke=true 使旧租约失效，未提交输出仍隔离在旧尝试目录 |
 | task.review | id, expected_task_revision, verdict（pass/rework）, evidence, method；检验输入与提交物未变，pass 时复制到独立 accepted 目录并在数据库中保存权威字节 |
 | recover | 扫描过期租约并重新排队；可选 task_id 只恢复某任务；不会认定旧进程已经停止 |
@@ -72,7 +73,7 @@ artifact.export/restore 由协调者或操作员调用，项目 completed 后仍
 
 协调者使用 `memory.put`（字段同 propose）写 active 记忆，或 `memory.accept`（id, expected_memory_revision）将 candidate 核验为 active；`memory.supersede`（old_id, new_id, expected_old_revision, expected_new_revision）保留旧历史并标记使用它的任务受影响。所有记忆均保存来源文件哈希。
 
-`checkpoint`（id, data）供协调者保存项目级检查点。工作者恢复信息保存在每个尝试的 checkpoints 中。`read()` 包含单位、聊天、任务、记忆、事件、outbox、检查点和当前协调身份；它是派生读取视图，不得手工写回数据库。
+`checkpoint`（id, data）供协调者保存项目级检查点。工作者恢复信息保存在每个尝试的 checkpoints 中。工作循环使用 view(actor, task_id=None, offset=0, limit=20) 的局部分页视图，并通过 apply --compact 只获取操作结果；完整 read()/status 含全量事件与历史，留给审计或故障诊断。所有读取结果均不得手工写回数据库。
 
 ## 真实会话操作与 outbox
 
@@ -83,7 +84,7 @@ artifact.export/restore 由协调者或操作员调用，项目 completed 后仍
 | outbox.resolve | id, expected_outbox_revision, status（delivered/unknown）, result；创建成功结果必须含 host_id/thread_id；不自动建立 chat.bind |
 | outbox.reconcile | id, expected_outbox_revision, resolution（delivered/not_sent）, evidence；delivered 要有 result 中真实 host_id/thread_id；仅 confirmed not_sent 可回 pending |
 
-inflight/unknown 请求禁止自动再次 begin，防止接口返回不明时重复创建聊天。协调者先使用宿主列表或状态工具对账，将真实结果记录后再绑定。已投递的同一请求不再重发。日志记录幂等 ID，不承诺宿主工具恰好执行一次。
+部门只派发自身 outbox 意图，跨部门目标须在 peer_unit_ids；消息带 task_id、最多 2000 字符的 summary 和可选 refs。暂停后可补登记自身既有 resolve/reconcile，但不能发起新派发。inflight/unknown 请求禁止自动再次 begin，防止接口返回不明时重复创建聊天。协调者先使用宿主列表或状态工具对账，将真实结果记录后再绑定。已投递的同一请求不再重发。日志记录幂等 ID，不承诺宿主工具恰好执行一次。
 
 重复 outbox.begin 的原请求会明确拒绝为 `dispatch_ambiguous`，即使原始请求后来已投递；适配器必须读取状态或对账，而不能把旧响应当成再次调用宿主工具的许可。确认 not_sent 后回 pending，使用新的幂等键发起 begin。创建请求预留聊天额度，已投递但尚未绑定的请求仍占用预留额度，直接绑定聊天不能挤占这些额度。派发前重新核验目标仍为 active。项目不能在仍有 pending、inflight 或 unknown 请求时标记完成。
 

@@ -93,7 +93,7 @@ background模式协调者的每笔业务交易必须携带顶层凭据：
 {"actor_id":"coordinator","idempotency_key":"work-unique","reason":"推进当前任务","wake_id":"wake-unique","wake_fence":1,"operations":[...]}
 ```
 
-协调者每个业务操作计入本 wake.actions；整笔交易超限时全部回滚。wake.begin/end、outbox.resolve/reconcile 不计业务动作额度，以便退出和记录已发生的副作用。工作者仍以各自 actor_id 与任务租约调用原任务操作，新增领取计入全项目 claims，正常提交不再次收费。
+协调者每个业务操作计入本 wake.actions；整笔交易超限时全部回滚。wake.begin/end、outbox.resolve/reconcile 不计业务动作额度，以便退出和记录已发生的副作用。工作者仍以各自 actor_id 与任务租约执行任务，负责人按持久委派执行本域组织与直接协作；不能复用协调 wake。新增领取计入全项目 claims，部门派发同时计入全局 dispatches 与委派累计额度，正常提交不再次收费。
 
 结束轮次调用独立 `wake.end {outcome:progress|idle|error}`，请求仍带当前 wake 凭据。progress 重置退避连击并使用 cooldown；idle/error 分别进行有上限的指数退避，基数 max(cooldown_seconds,1)，不会无限增长。结束轮次后旧 wake 凭据立即失效。到期后无法续活 wake；读取状态，以新 wake 恢复。
 

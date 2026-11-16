@@ -27,7 +27,7 @@ scripts/runtime.py 提供Python标准库SQLite运行时，接口为 Runtime(proj
 }
 ```
 
-`execution.mode` 默认 `foreground`：协调者在当前会话直接推进，不申请 wake，不绑定或启用自动化；`wake.begin/end` 被拒绝。仍检查项目暂停、章程期限、开始时间、任务领取与派发累计额度。`background` 明确启用调度机制的独占 wake 和单轮动作额度；新建后台计划仍需真实用户授权及宿主工具。模式在初始化后不可变。
+`execution.mode` 默认 `foreground`：协调职责在已选择且获授权的会话中推进，不申请 wake，不绑定或启用自动化；`wake.begin/end` 被拒绝。仍检查项目暂停、章程期限、开始时间、任务领取与派发累计额度。`background` 明确启用调度机制的独占 wake 和单轮动作额度；新建后台计划仍需真实用户授权及宿主工具。模式在初始化后不可变。
 
 `scheduler.not_before/expires_at` 沿用调度机制；未提供 expires_at 时为初始化后24小时。foreground 不计 wake 次数，也没有 wake 动作/时长窗口，不应宣称其模型轮次受到这些后台额度限制。两种模式均保留任务租约与并发限制。
 
@@ -35,9 +35,10 @@ scripts/runtime.py 提供Python标准库SQLite运行时，接口为 Runtime(proj
 
 ```text
 python -X utf8 runtime.py --project PROJECT init --charter FILE
-python -X utf8 runtime.py --project PROJECT status
+python -X utf8 runtime.py --project PROJECT view --actor ACTOR
+python -X utf8 runtime.py --project PROJECT view --actor ACTOR --task TASK
 python -X utf8 runtime.py --project PROJECT plan
-python -X utf8 runtime.py --project PROJECT apply --request FILE
+python -X utf8 runtime.py --project PROJECT apply --request FILE --compact
 python -X utf8 runtime.py --project PROJECT pause --actor operator --reason "用户暂停"
 python -X utf8 runtime.py --project PROJECT resume --actor operator --reason "按原预算继续"
 ```

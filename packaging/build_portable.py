@@ -9,7 +9,7 @@ import shutil
 import stat
 import zipfile
 
-VERSION = '4.1.2'
+VERSION = '4.2.1'
 NAME = 'adaptive-project-bundle'
 ALLOWED = {'.md', '.py', '.json', '.yaml', '.ps1'}
 DIRS = {'agents', 'assets', 'references', 'scripts', 'tests'}

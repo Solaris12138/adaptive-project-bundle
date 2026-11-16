@@ -1,0 +1,70 @@
+{
+  "version": "4.2.1",
+  "date": "2026-11-17",
+  "timezone": "Asia/Shanghai",
+  "verdict": "PASS within observed host scope",
+  "ordinary_goal_live": {
+    "departments": 2,
+    "native_peer_messages": 3,
+    "peer_reviews": 2,
+    "root_business_followups": 0,
+    "tasks": 2,
+    "accepted_artifacts": 7,
+    "dispatches": 7,
+    "claims": 2,
+    "project_completed": true,
+    "all_chats_idle": true,
+    "raw_prompt": "Ordinary business objective, skill invocation, project location and bounded authorization only",
+    "context_reduction": null,
+    "environment_limit": "Existing host/project environment; AGENTS may be inherited"
+  },
+  "prior_department_live": {
+    "departments": 2,
+    "native_peer_messages": 4,
+    "peer_reviews": 3,
+    "runtime_json_reduction": 0.881005800308109,
+    "scope": "Only paired runtime JSON outputs, not total tokens/context/cost"
+  },
+  "package": {
+    "archive": "adaptive-project.zip",
+    "sha256": "4b753b3b6320a247e6a7213c946ff5f0351c47285204e313a8f2bc99e091068d",
+    "skill_files": 29
+  },
+  "evidence_digests": {
+    "ordinary_goal_live": {
+      "sha256": "69ecb34bac1a432f5397e1eebb15b65fd8615e27a61744d3be9ac2e33d0e68fb",
+      "distribution": "Raw report retained privately by maintainer; digest is an integrity reference, not a public independent attestation"
+    },
+    "previous_department_live": {
+      "sha256": "533b1e55a38f068fd9c9f089356f9b05b3bc5eb01220fda6c6949a693a3b7ae5",
+      "distribution": "Raw report retained privately by maintainer; digest is an integrity reference, not a public independent attestation"
+    },
+    "defaults_package_checks": {
+      "sha256": "f908cbbd7cb1477c92501e22763b63d5ddb3f9adb505f502f6911e70471ec764",
+      "distribution": "Raw report retained privately by maintainer; digest is an integrity reference, not a public independent attestation"
+    },
+    "historical_app_restart": {
+      "sha256": "a0037ae4609a40e9e2f2f82390087df0c6f985aad28062c3a5354f5e6ac6f461",
+      "distribution": "Raw report retained privately by maintainer; digest is an integrity reference, not a public independent attestation"
+    }
+  },
+  "limitations": [
+    "No new shutdown/power-loss trial",
+    "No macOS/Linux target-device validation",
+    "No real customer or product effectiveness validation",
+    "No automatic discovery guarantee for every host"
+  ],
+  "automated_validation": {
+    "full_regression": {
+      "run": 178,
+      "passed": 176,
+      "skipped": 2,
+      "skip_reason": "OS does not permit isolated symlink/junction creation"
+    },
+    "portable_checks": {
+      "passed": 23,
+      "reuse_basis": "Rebuilt archive byte-identical to the checked 4.2.1 artifact"
+    },
+    "versioned_filenames_in_public_candidates": 0
+  }
+}
